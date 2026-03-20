@@ -15,6 +15,7 @@ from vllm.triton_utils import triton
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
+from .ssd_fused_scan import _fused_chunk_scan_fwd
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
@@ -107,38 +108,33 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
     # (middle term of factorization of off-diag blocks; A terms)
-    # - parallelized across sequences using last_chunk_indices to derive
-    #   per-sequence chunk ranges. Each sequence's state passing runs independently.
+    # - for handling chunked prefill, this requires i) initial_states and
+    #   ii) seq_idx to be all specified.
+    # - When a new seq_idx is detected, we will stop passing the prev_state
+    #   and switch accordingly to the init_state corresponding to the new seq_idx.
     states = _state_passing_fwd(
         rearrange(states, "... p n -> ... (p n)"),
         dA_cumsum,  # (nheads, nchunks, chunk_size)
-        last_chunk_indices,
+        cu_chunk_seqlens,
         initial_states=rearrange(initial_states, "... p n -> ... (p n)")
         if initial_states is not None
         else None,  # (batch, nheads, headdim*dstate)
+        seq_idx=seq_idx,
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
     )
     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
 
-    # 4. Compute batched matrix multiply for C_j^T B_i terms
-    CB = _bmm_chunk_fwd(C, B, chunk_size, cu_chunk_seqlens, output_dtype=torch.float32)
-
-    # 5. Scan and compute the diagonal blocks, taking into
-    #    account past causal states.
-    # - if initial states are provided, then states information will be
-    #   augmented with initial_states.
-    # - to do this properly, we need to account for example changes in
-    #   the continuous batch, therefore we introduce pseudo chunks, which is
-    #   a chunk that is split up each time an example changes.
-    # - in each (pseudo) chunk, we detect if the previous (pseudo) chunk had
-    #   a seq_idx change, in which case we take states information from
-    #   init_states.
-    _chunk_scan_fwd(
-        CB,
+    # 4+5. Fused BMM + ChunkScan: computes CB on-the-fly in SRAM, never
+    #       materialising the (nchunks, ngroups, chunk_size, chunk_size) CB
+    #       tensor in HBM.  Equivalent to the original two-step sequence:
+    #         CB = _bmm_chunk_fwd(C, B, chunk_size, ...)
+    #         _chunk_scan_fwd(CB, x, ...)
+    _fused_chunk_scan_fwd(
         x,
+        B,
+        C,
         dt,
         dA_cumsum,
-        C,
         states,
         cu_chunk_seqlens,
         out,  # in-place update
