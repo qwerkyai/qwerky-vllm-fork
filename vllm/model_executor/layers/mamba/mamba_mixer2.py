@@ -466,17 +466,6 @@ class MambaMixer2(MambaBase, PluggableLayer):
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
         )
 
-        # - get hidden_states, B and C after depthwise convolution.
-        self.split_hidden_states_B_C_fn = lambda hidden_states_B_C: torch.split(
-            hidden_states_B_C,
-            [
-                self.intermediate_size // self.tp_size,
-                self.groups_ssm_state_size // self.tp_size,
-                self.groups_ssm_state_size // self.tp_size,
-            ],
-            dim=-1,
-        )
-
         vllm_config = get_current_vllm_config()
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -595,9 +584,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         if attn_metadata is None:
             # profile run
-            hidden_states_B_C = (
-                hidden_states_B_C.transpose(0, 1).clone().transpose(0, 1)
-            ).contiguous()
+            hidden_states_B_C = hidden_states_B_C.contiguous()
             hidden_states, _B, _C = self.split_hidden_states_B_C_fn(hidden_states_B_C)
             return hidden_states
 
@@ -740,54 +727,51 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # then chunk_stride = 2
                 chunk_stride = mamba_block_size // chunk_size
 
+                # Pre-compute per-sequence scalars with a single GPU→CPU
+                # transfer to avoid one sync per loop iteration.
+                n_blocks_to_fill_all = (
+                    block_idx_last_scheduled_token_p
+                    - block_idx_first_scheduled_token_p
+                ).tolist()
+                block_idx_firsts = block_idx_first_scheduled_token_p.tolist()
+
+                # first_chunk[0]=0; first_chunk[i]=last_chunk_indices_p[i-1]+1
+                first_chunks_t = torch.empty(
+                    num_prefills,
+                    dtype=last_chunk_indices_p.dtype,
+                    device=last_chunk_indices_p.device,
+                )
+                first_chunks_t[0] = 0
+                if num_prefills > 1:
+                    first_chunks_t[1:] = last_chunk_indices_p[:-1] + 1
+
+                num_unaligned = num_computed_tokens_p % mamba_block_size
+                correction = torch.where(
+                    num_unaligned > 0,
+                    num_unaligned // chunk_size,
+                    torch.zeros_like(num_unaligned),
+                )
+                first_aligned_chunks = (
+                    first_chunks_t + chunk_stride - 1 - correction
+                ).tolist()
+
                 # Save state for sequences with more than just final state
                 for seq_idx in range(num_prefills):
-                    # Block index for the first scheduled token
-                    block_idx_first_scheduled_token = block_idx_first_scheduled_token_p[
-                        seq_idx
-                    ]
-
-                    # Block index for the last scheduled token
-                    block_idx_last_scheduled_token = block_idx_last_scheduled_token_p[
-                        seq_idx
-                    ]
-
-                    # Number of blocks that need to be written
-                    n_blocks_to_fill = (
-                        block_idx_last_scheduled_token - block_idx_first_scheduled_token
-                    )
+                    n_blocks_to_fill = n_blocks_to_fill_all[seq_idx]
 
                     # Skip sequences that don't have any blocks to fill
                     if n_blocks_to_fill == 0:
                         continue
 
+                    block_idx_first = block_idx_firsts[seq_idx]
+
                     # Look up the state indices
                     cache_blocks_to_fill = state_indices_tensor_p[
                         seq_idx,
-                        block_idx_first_scheduled_token:block_idx_last_scheduled_token,
+                        block_idx_first : block_idx_first + n_blocks_to_fill,
                     ]
 
-                    # First chunk index for this sequence
-                    if seq_idx == 0:
-                        first_chunk = 0
-                    else:
-                        first_chunk = 1 + last_chunk_indices_p[seq_idx - 1]
-
-                    # First chunk that is aligned on the mamba block boundary
-                    first_aligned_chunk = first_chunk + chunk_stride - 1
-
-                    # Calculate the number of computed tokens that were not
-                    # already cached
-                    num_unaligned_computed_tokens = (
-                        num_computed_tokens_p[seq_idx] % mamba_block_size
-                    )
-
-                    if num_unaligned_computed_tokens > 0:
-                        # If the number of computed tokens is not block aligned,
-                        # then we need to shift the index accordingly
-                        first_aligned_chunk -= (
-                            num_unaligned_computed_tokens // chunk_size
-                        )
+                    first_aligned_chunk = first_aligned_chunks[seq_idx]
 
                     # Get states to write
                     from_where = varlen_states[
@@ -852,11 +836,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # 3. State Space Model sequence transformation
             n_groups = self.n_groups // self.tp_size
-            A_d = (
-                self.A[:, None, ...][:, :, None]
-                .expand(-1, self.head_dim, self.ssm_state_size)
-                .to(dtype=torch.float32)
-            )
+            A_d = self.A[:, None, None].expand(-1, self.head_dim, self.ssm_state_size)
             dt_d = dt_d[:, :, None].expand(-1, -1, self.head_dim)
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
             D_d = self.D[:, None, ...].expand(-1, self.head_dim)
