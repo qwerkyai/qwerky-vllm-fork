@@ -18,6 +18,7 @@
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.triton_utils import tl, triton
 
 from .mamba_ssm import softplus
@@ -25,6 +26,34 @@ from .mamba_ssm import softplus
 
 @triton.autotune(
     configs=[
+        # Small headdim/dstate configs (hdim<=64, dstate<=128) - increased parallelism
+        triton.Config(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
+            num_stages=3,
+            num_warps=4,
+        ),
+        # Low register pressure configs for large dstate (dstate=128)
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
+            num_stages=2,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
+            num_stages=2,
+            num_warps=4,
+        ),
+        # original configs for larger headdim/dstate values
         triton.Config(
             {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
             num_stages=3,
@@ -255,7 +284,7 @@ def _fused_cumsum_state_kernel(
         ).to(tl.float32)
 
         # Scale B by decay and dt (same as original)
-        scale = tl.exp(dA_cs_last - dA_cs_k) * dt_k
+        scale = fast_exp(dA_cs_last - dA_cs_k) * dt_k
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)
         acc += tl.dot(x, b)
@@ -331,7 +360,7 @@ def _fused_cumsum_chunk_state_fwd(
         nheads,
     )
 
-    with torch.cuda.device(x.device.index):
+    with torch.accelerator.device_index(x.device.index):
         _fused_cumsum_state_kernel[grid](
             x_ptr=x,
             b_ptr=B,
