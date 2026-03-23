@@ -12,9 +12,7 @@ from packaging import version
 
 from vllm.triton_utils import triton
 
-from .ssd_bmm import _bmm_chunk_fwd
-from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
+from .ssd_fused_cumsum_state import _fused_cumsum_chunk_state_fwd
 from .ssd_fused_scan import _fused_chunk_scan_fwd
 from .ssd_state_passing import _state_passing_fwd
 
@@ -88,22 +86,20 @@ def _mamba_chunk_scan_combined_fwd(
     # - see the blog and paper for a visualization of the submatrices
     #   which we refer to in the comments below
 
-    # 1. Compute chunked cumsum of A * dt
-    # - here dt may go through a softplus activation
-    dA_cumsum, dt = _chunk_cumsum_fwd(
+    # 1+2. Fused Cumsum + ChunkState: computes dA_cumsum and dt_processed
+    #       on-the-fly from raw dt inside the chunk_state kernel, avoiding
+    #       one kernel launch and the HBM read of dt/dA_cumsum by chunk_state.
+    dA_cumsum, dt, states = _fused_cumsum_chunk_state_fwd(
         dt,
         A,
+        B,
+        x,
         chunk_size,
         cu_chunk_seqlens,
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
-    )
-
-    # 2. Compute the state for each intra-chunk
-    # (right term of low-rank factorization of off-diagonal blocks; B terms)
-    states = _chunk_state_fwd(
-        B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True
+        states_in_fp32=True,
     )
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
